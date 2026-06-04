@@ -1,6 +1,11 @@
 # AWS Account Migration Pre-Check for Control Tower Enrollment
 
+![Tests](https://github.com/jbarnes/aws-core-service-check/actions/workflows/test.yml/badge.svg)
+![Pylint](https://github.com/jbarnes/aws-core-service-check/actions/workflows/pylint.yml/badge.svg)
+
 Pre-migration validation script for AWS accounts being migrated from one organization to another organization with AWS Control Tower.
+
+This tool is strictly **read-only**: it inspects your accounts and reports findings. It never creates, modifies, or deletes any AWS resource. Remediation steps are documented below for you to run deliberately.
 
 ## Use Case
 
@@ -78,7 +83,7 @@ These services may have delegated admin relationships that will break:
 
 ## Prerequisites
 
-- Python 3.7+
+- Python 3.9 or higher
 - Run from **Organization A's management account**
 - AWS credentials with permissions to:
   - Assume `OrganizationAccountAccessRole` in all member accounts
@@ -96,8 +101,41 @@ pip install -r requirements.txt
 Run from **Organization A's management account** with credentials that can assume roles in member accounts:
 
 ```bash
-python src/check_services.py
+python3 check_services.py
 ```
+
+Or, if installed as a package (`pip install .`):
+
+```bash
+aws-core-service-check
+```
+
+### Options
+
+```
+--role-name ROLE   IAM role to assume in member accounts
+                   (default: OrganizationAccountAccessRole)
+--output-dir DIR   Directory for the JSON results file (default: output/)
+--stdout           Write JSON results to stdout instead of a file
+--quiet            Suppress progress messages on stderr
+```
+
+Progress messages and the human-readable summary go to **stderr**, so stdout
+stays clean for piping JSON:
+
+```bash
+python3 check_services.py --stdout --quiet | jq '.[].findings'
+```
+
+### Exit codes
+
+The script returns a meaningful exit code so it can gate a migration pipeline:
+
+| Code | Meaning |
+|------|---------|
+| `0`  | Completed; no CRITICAL blockers found |
+| `2`  | Completed; one or more CRITICAL blockers found |
+| `1`  | Fatal error (e.g. unable to read the organization) |
 
 The script will:
 1. Discover all accounts in Organization A
@@ -127,7 +165,8 @@ The script provides a two-tier output:
   - Other informational findings
 
 ### JSON File Output
-- File: `aws-service-check-results.json`
+- File: `output/aws-service-check-results-<account>-<timestamp>.json` (timestamp is UTC; re-runs do not overwrite previous results)
+- Use `--stdout` to emit the JSON to stdout instead of a file
 - Complete structured data for all findings
 - Includes criticality levels for automation/filtering
 - Can be parsed by other tools or imported for analysis
@@ -292,3 +331,32 @@ done
 2. Invite/create accounts in Organization B
 3. Enroll accounts in Control Tower
 4. Re-establish delegated admin relationships in Organization B
+
+## Development
+
+Install development dependencies and run the checks:
+
+```bash
+make install   # runtime + dev dependencies (pytest, pylint)
+make test      # pytest tests/ -v
+make lint      # pylint check_services.py --fail-under=9.0
+```
+
+Tests use `pytest` with mocked AWS API calls, so no AWS credentials are required
+to run them. See [CONTRIBUTING.md](CONTRIBUTING.md) for pull request and release
+guidelines, and [CHANGELOG.md](CHANGELOG.md) for the version history.
+
+## Feedback, improvements, issues
+
+Please feel free to raise Pull Requests or Issues with identified problems or
+feedback. Thank you.
+
+---
+
+## Development with Claude Code
+
+This project is developed with assistance from [Claude Code](https://claude.ai/code),
+Anthropic's agentic command-line tool. Claude Code is used throughout the
+workflow: authoring and refactoring the CLI, hardening the AWS checks for
+correctness, expanding the test suite, keeping the CI workflows consistent, and
+reviewing changes for correctness and cleanups before they land.
