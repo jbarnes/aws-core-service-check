@@ -45,7 +45,7 @@ Severity legend: **CRITICAL** blocks Control Tower enrollment and must be resolv
 - Python 3.9 or higher
 - Run from **Organization A's management account**
 - AWS credentials with permissions to:
-  - Assume `OrganizationAccountAccessRole` in all member accounts
+  - Assume `OrganizationAccountAccessRole` (or the role given via `--role-name`) in all member accounts
   - Read organization information (`organizations:*`)
   - Query all services listed above (read-only permissions)
 
@@ -78,6 +78,26 @@ aws-core-service-check
 --stdout           Write JSON results to stdout instead of a file
 --quiet            Suppress progress messages on stderr
 ```
+
+### Using a custom cross-account role
+
+By default the script assumes `OrganizationAccountAccessRole` in each member
+account. Use `--role-name` to assume a different role instead:
+
+```bash
+python3 check_services.py --role-name MyReadOnlyScanRole
+```
+
+Notes:
+
+- The role name must exist (with the same name) in **every** member account
+  you want to scan, and its trust policy must allow the calling identity to
+  assume it.
+- The account you are **currently authenticated in** is scanned with your
+  ambient credentials directly — the script does not assume a role into itself,
+  so `--role-name` only applies to the other accounts.
+- Accounts where the role cannot be assumed are reported as per-account errors;
+  the scan continues with the remaining accounts.
 
 Progress messages and the human-readable summary go to **stderr**, so stdout
 stays clean for piping JSON:
@@ -225,8 +245,9 @@ Needs these permissions to run the script:
 }
 ```
 
-### Member Account Role (OrganizationAccountAccessRole)
-Needs read permissions for (these checks also run against the management account):
+### Member Account Role (`OrganizationAccountAccessRole`, or your `--role-name`)
+The assumed role in each member account needs read permissions for (these checks
+also run against the management account):
 - `config:Describe*`
 - `cloudtrail:DescribeTrails`
 - `sns:ListTopics`
