@@ -20,77 +20,25 @@ Run this script in **Organization A** (source organization) **before** migrating
 
 ## Services Checked
 
-### CRITICAL - Blocks Control Tower Enrollment
+Severity legend: **CRITICAL** blocks Control Tower enrollment and must be resolved first; **HIGH** breaks or is disrupted after migration; **INFO** is advisory (no action strictly required).
 
-These **MUST** be resolved before enrolling in Control Tower:
-
-#### AWS Config (Regional)
-- **Configuration Recorders** - Control Tower creates its own; existing recorders cause enrollment failure
-- **Delivery Channels** - Must be deleted along with recorders
-- **Aggregation Authorizations** - Existing authorizations may need cleanup
-- **Action Required**: Delete all Config recorders, delivery channels, and aggregation authorizations in ALL regions
-
-#### STS - Security Token Service (Regional)
-- **STS Endpoint Status** - STS must be enabled in all regions
-- **Action Required**: Enable STS in Account Settings for all regions
-
-#### SNS Topics (Regional)
-- **Naming Conflicts** - Topics with Control Tower naming patterns will block enrollment
-  - `aws-controltower-SecurityNotifications`
-  - `aws-controltower-AggregateSecurityNotifications`
-- **Action Required**: Rename or delete conflicting SNS topics
-
-#### Leftover Control Tower IAM Roles (Global)
-- Roles left behind from a previous Control Tower enrollment cause "role already exists" failures when enrolling into a new organization's Control Tower:
-  - `AWSControlTowerExecution`, `aws-controltower-AdministratorExecutionRole`, `aws-controltower-ReadOnlyExecutionRole`, `aws-controltower-ConfigRecorderRole`, `aws-controltower-ForwardSnsNotificationRole`, `aws-controltower-CloudWatchLogsRole`
-- **Action Required**: Delete these roles before re-enrolling
-
-#### Leftover Control Tower CloudFormation Stacks (Regional)
-- Baseline stacks named `AWSControlTowerBP-*` left over from a previous Control Tower cause resource-naming conflicts on re-enrollment (in **every** region the account was deployed to)
-- **Action Required**: Delete the leftover stacks in all regions before re-enrolling
-
-### CRITICAL - Management Account Only (Organization A)
-
-These exist only in the management account of the source organization:
-
-- **AWS Organizations**
-  - Organization structure, SCPs, delegated administrators
-  - **Note**: This is expected; documents what needs to be recreated in Organization B
-- **AWS Control Tower**
-  - Detects if already enrolled in CT in Organization A
-- **IAM Identity Center (SSO)**
-  - Cannot migrate SSO configuration between orgs
-  - **Action Required**: Disable in Org A, reconfigure in Org B
-
-### HIGH - Organization-Tied Resources
-
-These resources reference the organization and will break after migration:
-
-#### AWS Backup (Regional)
-- **Backup Vaults** with organization-based access policies
-- **Action Required**: Update vault policies to remove org references
-
-#### AWS RAM - Resource Access Manager (Global)
-- **Resource Shares** shared with the organization
-- **Action Required**: Re-share resources after migration or update principals
-
-#### CloudTrail (Regional)
-- **Organization Trails** - Will stop logging when account leaves org
-- **Action Required**: Create account-level trails or plan for new org trail
-- **Account-level Trails (INFO)** - Will continue to bill *in addition* to the org trail Control Tower creates at enrollment, resulting in duplicate CloudTrail charges
-- **Action Required**: Consider deleting redundant account-level trails after enrollment
-
-### HIGH - Delegated Administrator Membership
-
-These services may have delegated admin relationships that will break:
-
-#### Security Hub (Regional)
-- **Delegated Admin Membership** - Member relationship to Org A admin account
-- **Action Required**: Disassociate before migration; will re-associate in Org B
-
-#### GuardDuty (Regional)
-- **Delegated Admin Membership** - Member relationship to Org A admin account
-- **Action Required**: Disassociate before migration; will re-associate in Org B
+| Service | Scope | Severity | What's detected | Action required |
+|---------|-------|----------|-----------------|-----------------|
+| AWS Config | Regional | CRITICAL | Configuration recorders, delivery channels, and aggregation authorizations (Control Tower creates its own) | Delete recorders, delivery channels, and aggregation authorizations in all regions |
+| STS (Security Token Service) | Regional | CRITICAL | STS disabled in a region | Enable STS in Account Settings for all regions |
+| SNS Topics | Regional | CRITICAL | Topics conflicting with Control Tower names (`aws-controltower-SecurityNotifications`, `aws-controltower-AggregateSecurityNotifications`) | Rename or delete the conflicting topics |
+| Leftover Control Tower IAM roles | Global | CRITICAL | Roles from a prior Control Tower (`AWSControlTowerExecution`, `aws-controltower-AdministratorExecutionRole`, `-ReadOnlyExecutionRole`, `-ConfigRecorderRole`, `-ForwardSnsNotificationRole`, `-CloudWatchLogsRole`) that cause "role already exists" failures | Delete these roles before re-enrolling |
+| Leftover Control Tower CloudFormation stacks | Regional | CRITICAL | Baseline stacks named `AWSControlTowerBP-*` that cause resource-naming conflicts on re-enrollment | Delete the leftover stacks in every region they were deployed to |
+| AWS Organizations | Global (mgmt) | CRITICAL | Organization structure, SCPs, and delegated administrators | Expected; documents what must be recreated in the destination org |
+| AWS Control Tower | Global (mgmt) | CRITICAL | Whether the source org is already enrolled in Control Tower | Plan an alternate migration path if already enrolled |
+| IAM Identity Center (SSO) | Global (mgmt) | CRITICAL | SSO instance present (cannot migrate between orgs) | Disable in the source org, reconfigure in the destination org |
+| AWS Backup | Regional | HIGH | Backup vaults with organization-based access policies | Update vault policies to remove org references |
+| AWS RAM (Resource Access Manager) | Global | HIGH | Resource shares shared with the organization | Re-share after migration or update principals |
+| CloudTrail (org trails) | Regional | HIGH | Organization trails that stop logging when the account leaves the org | Create account-level trails or plan for a new org trail |
+| Security Hub | Regional | HIGH | Delegated-admin membership to the source org's admin account | Disassociate before migration; re-associate in the destination org |
+| GuardDuty | Regional | HIGH | Delegated-admin membership to the source org's admin account | Disassociate before migration; re-associate in the destination org |
+| CloudTrail (account trails) | Regional | INFO | Account-level trails that bill in addition to the org trail Control Tower creates, causing duplicate charges | Consider deleting redundant trails after enrollment |
+| EC2 Default VPC | Regional | INFO | Default VPC present (Control Tower removes it during baselining) | Be aware; a re-added default VPC can put the account in a Tainted state |
 
 ## Prerequisites
 
@@ -288,26 +236,6 @@ Needs read permissions for (these checks also run against the management account
 - `iam:GetRole`
 - `cloudformation:ListStacks`
 - `ec2:DescribeRegions`, `ec2:DescribeVpcs`
-
-## Common Issues Found
-
-Based on AWS Control Tower documentation, these are the most common enrollment blockers:
-
-| Issue | Severity | Fix |
-|-------|----------|-----|
-| Config recorders exist | CRITICAL | Delete using AWS CLI in all regions |
-| Config delivery channels exist | CRITICAL | Delete using AWS CLI in all regions |
-| STS disabled in regions | CRITICAL | Enable in Account Settings |
-| SNS topic name conflicts | CRITICAL | Rename or delete conflicting topics |
-| Leftover Control Tower IAM roles | CRITICAL | Delete the aws-controltower-* / AWSControlTowerExecution roles |
-| Leftover AWSControlTowerBP-* CFN stacks | CRITICAL | Delete the leftover baseline stacks in all regions |
-| Security Hub delegated admin | HIGH | Disassociate from old org admin |
-| GuardDuty delegated admin | HIGH | Disassociate from old org admin |
-| Organization CloudTrail trails | HIGH | Create account-level trails |
-| AWS Backup org policies | HIGH | Update vault policies |
-| RAM org shares | HIGH | Update share principals |
-| Account-level CloudTrail trails | INFO | Delete redundant trails to avoid duplicate charges |
-| Default VPC present | INFO | Be aware Control Tower removes it; avoid re-adding |
 
 ## Next Steps After Running
 
