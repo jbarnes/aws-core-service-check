@@ -1,0 +1,40 @@
+# Scan output (may contain real account IDs / ARNs)
+output/
+aws-service-check-results*.json
+
+# Claude Code
+CLAUDE.md
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Testing
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+*.cover
+.hypothesis/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
