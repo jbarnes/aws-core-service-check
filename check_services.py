@@ -114,15 +114,21 @@ def get_enabled_regions(session: boto3.Session) -> List[str]:
     return sorted(region["RegionName"] for region in response["Regions"])
 
 
-def assume_role(account_id: str, role_name: str) -> boto3.Session:
-    """Assume ``role_name`` in ``account_id`` and return a scoped session."""
+def assume_role(
+    account_id: str, role_name: str, external_id: Optional[str] = None
+) -> boto3.Session:
+    """Assume ``role_name`` in ``account_id`` and return a scoped session.
+
+    If ``external_id`` is given it is passed to ``AssumeRole`` for roles whose
+    trust policy requires an ExternalId.
+    """
     role_arn = f"arn:aws:iam::{account_id}:role/{role_name}"
+    params = {"RoleArn": role_arn, "RoleSessionName": "CoreServiceCheck"}
+    if external_id:
+        params["ExternalId"] = external_id
     sts_client = boto3.client("sts")
     try:
-        response = sts_client.assume_role(
-            RoleArn=role_arn,
-            RoleSessionName="CoreServiceCheck",
-        )
+        response = sts_client.assume_role(**params)
     except botocore.exceptions.ClientError as error:
         log(f"  Failed to assume role {role_name} in {account_id}: {error}")
         raise
@@ -771,6 +777,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
              "(default: OrganizationAccountAccessRole).",
     )
     parser.add_argument(
+        "--external-id",
+        default=None,
+        help="ExternalId to pass when assuming the member-account role, for "
+             "roles whose trust policy requires it.",
+    )
+    parser.add_argument(
         "--output-dir",
         default="output",
         help="Directory for the JSON results file (default: output/).",
@@ -814,7 +826,7 @@ def run(args: argparse.Namespace) -> int:
                     quiet=args.quiet)
                 session = boto3.Session()
             else:
-                session = assume_role(account_id, args.role_name)
+                session = assume_role(account_id, args.role_name, args.external_id)
             all_results.append(
                 check_account_services(
                     account_id, session, management_account_id, quiet=args.quiet

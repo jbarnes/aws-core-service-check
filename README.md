@@ -74,6 +74,8 @@ aws-core-service-check
 ```
 --role-name ROLE   IAM role to assume in member accounts
                    (default: OrganizationAccountAccessRole)
+--external-id ID   ExternalId to pass when assuming the member-account role,
+                   for roles whose trust policy requires it
 --output-dir DIR   Directory for the JSON results file (default: output/)
 --stdout           Write JSON results to stdout instead of a file
 --quiet            Suppress progress messages on stderr
@@ -86,6 +88,12 @@ account. Use `--role-name` to assume a different role instead:
 
 ```bash
 python3 check_services.py --role-name MyReadOnlyScanRole
+```
+
+If the role's trust policy requires an ExternalId, pass it with `--external-id`:
+
+```bash
+python3 check_services.py --role-name MyReadOnlyScanRole --external-id my-external-id
 ```
 
 Notes:

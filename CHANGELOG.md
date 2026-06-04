@@ -5,6 +5,12 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `--external-id` to pass an ExternalId when assuming the member-account role,
+  for roles whose trust policy requires it.
+
 ## [1.0.0] - 2026-06-04
 
 ### Added

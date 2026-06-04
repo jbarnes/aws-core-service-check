@@ -374,9 +374,40 @@ def test_write_json_output_creates_timestamped_file(tmp_path):
 def test_parse_args_defaults():
     args = check_services.parse_args([])
     assert args.role_name == "OrganizationAccountAccessRole"
+    assert args.external_id is None
     assert args.output_dir == "output"
     assert args.stdout is False
     assert args.quiet is False
+
+
+def test_parse_args_external_id():
+    args = check_services.parse_args(["--external-id", "secret123"])
+    assert args.external_id == "secret123"
+
+
+def test_assume_role_omits_external_id_when_absent(monkeypatch):
+    sts = MagicMock()
+    sts.assume_role.return_value = {"Credentials": {
+        "AccessKeyId": "a", "SecretAccessKey": "b", "SessionToken": "c"
+    }}
+    monkeypatch.setattr(check_services.boto3, "client", lambda service: sts)
+    monkeypatch.setattr(check_services.boto3, "Session", lambda **kw: kw)
+    check_services.assume_role("111122223333", "MyRole")
+    _, kwargs = sts.assume_role.call_args
+    assert kwargs["RoleArn"] == "arn:aws:iam::111122223333:role/MyRole"
+    assert "ExternalId" not in kwargs
+
+
+def test_assume_role_passes_external_id(monkeypatch):
+    sts = MagicMock()
+    sts.assume_role.return_value = {"Credentials": {
+        "AccessKeyId": "a", "SecretAccessKey": "b", "SessionToken": "c"
+    }}
+    monkeypatch.setattr(check_services.boto3, "client", lambda service: sts)
+    monkeypatch.setattr(check_services.boto3, "Session", lambda **kw: kw)
+    check_services.assume_role("111122223333", "MyRole", external_id="secret123")
+    _, kwargs = sts.assume_role.call_args
+    assert kwargs["ExternalId"] == "secret123"
 
 
 def test_run_returns_2_on_critical(monkeypatch, capsys):
