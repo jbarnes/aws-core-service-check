@@ -134,7 +134,7 @@ def test_sns_conflicting_topic_flagged():
 # --------------------------------------------------------------------------- #
 # CloudTrail org-trail check
 # --------------------------------------------------------------------------- #
-def test_cloudtrail_org_trail_flagged():
+def test_cloudtrail_org_and_account_trails_flagged():
     session = MagicMock()
     session.client.return_value.describe_trails.return_value = {
         "trailList": [
@@ -143,9 +143,28 @@ def test_cloudtrail_org_trail_flagged():
         ]
     }
     results = []
-    check_services.check_cloudtrail_org_trails(session, "us-east-1", results)
-    assert len(results) == 1
-    assert results[0]["details"].startswith("Trail: org")
+    check_services.check_cloudtrail_trails(session, "us-east-1", results)
+    services = {r["service"] for r in results}
+    assert "CloudTrail - Org Trail" in services
+    assert "CloudTrail - Account Trail" in services
+    org = next(r for r in results if r["service"] == "CloudTrail - Org Trail")
+    assert org["criticality"].startswith("HIGH")
+
+
+def test_cloudtrail_multiregion_shadow_skipped():
+    session = MagicMock()
+    session.client.return_value.describe_trails.return_value = {
+        "trailList": [
+            {
+                "Name": "mr", "TrailARN": "arn:mr", "IsOrganizationTrail": False,
+                "IsMultiRegionTrail": True, "HomeRegion": "us-east-1",
+            }
+        ]
+    }
+    results = []
+    # In a non-home region the shadow copy should be ignored.
+    check_services.check_cloudtrail_trails(session, "eu-west-1", results)
+    assert results == []
 
 
 # --------------------------------------------------------------------------- #
@@ -169,6 +188,72 @@ def test_securityhub_not_enabled_is_swallowed():
     )
     results = []
     check_services.check_securityhub_delegation(session, "us-east-1", results)
+    assert results == []
+
+
+# --------------------------------------------------------------------------- #
+# Leftover Control Tower resources (new checks)
+# --------------------------------------------------------------------------- #
+def test_iam_leftover_ct_role_flagged_critical():
+    session = MagicMock()
+    client = session.client.return_value
+
+    def get_role(RoleName):  # noqa: N803 - matches boto3 kwarg
+        if RoleName == "AWSControlTowerExecution":
+            return {"Role": {"RoleName": RoleName}}
+        raise make_client_error("NoSuchEntity")
+
+    client.get_role.side_effect = get_role
+    results = []
+    check_services.check_controltower_iam_roles(session, results)
+    assert len(results) == 1
+    assert results[0]["service"] == "IAM - Control Tower Role"
+    assert results[0]["criticality"].startswith("CRITICAL")
+    assert "AWSControlTowerExecution" in results[0]["details"]
+
+
+def test_iam_no_leftover_roles_is_clean():
+    session = MagicMock()
+    session.client.return_value.get_role.side_effect = make_client_error("NoSuchEntity")
+    results = []
+    check_services.check_controltower_iam_roles(session, results)
+    assert results == []
+
+
+def test_cfn_leftover_ct_stack_flagged_critical():
+    session = MagicMock()
+    paginator = MagicMock()
+    paginator.paginate.return_value = [
+        {"StackSummaries": [
+            {"StackName": "AWSControlTowerBP-BASELINE-CLOUDTRAIL"},
+            {"StackName": "my-own-stack"},
+        ]}
+    ]
+    session.client.return_value.get_paginator.return_value = paginator
+    results = []
+    check_services.check_controltower_cfn_stacks(session, "us-east-1", results)
+    assert len(results) == 1
+    assert results[0]["criticality"].startswith("CRITICAL")
+    assert "AWSControlTowerBP-BASELINE-CLOUDTRAIL" in results[0]["details"]
+
+
+def test_default_vpc_flagged():
+    session = MagicMock()
+    session.client.return_value.describe_vpcs.return_value = {
+        "Vpcs": [{"VpcId": "vpc-123"}]
+    }
+    results = []
+    check_services.check_default_vpc(session, "us-east-1", results)
+    assert len(results) == 1
+    assert results[0]["service"] == "EC2 - Default VPC"
+    assert "vpc-123" in results[0]["details"]
+
+
+def test_no_default_vpc_is_clean():
+    session = MagicMock()
+    session.client.return_value.describe_vpcs.return_value = {"Vpcs": []}
+    results = []
+    check_services.check_default_vpc(session, "us-east-1", results)
     assert results == []
 
 
@@ -222,6 +307,22 @@ def test_get_all_account_ids_keeps_management_when_present(monkeypatch):
     assert ids.count("999") == 1
 
 
+def test_get_all_account_ids_handles_unknown_management(monkeypatch):
+    # When the management account cannot be identified (None), just list accounts.
+    monkeypatch.setattr(
+        check_services, "aws_org_accounts", lambda: [{"Id": "111"}, {"Id": "222"}]
+    )
+    ids = check_services.get_all_account_ids(None)
+    assert ids == ["111", "222"]
+
+
+def test_management_account_id_returns_none_on_access_denied(monkeypatch):
+    client = MagicMock()
+    client.describe_organization.side_effect = make_client_error("AccessDeniedException")
+    monkeypatch.setattr(check_services.boto3, "client", lambda service: client)
+    assert check_services.aws_org_management_account_id() is None
+
+
 # --------------------------------------------------------------------------- #
 # Reporting / output
 # --------------------------------------------------------------------------- #
@@ -246,6 +347,16 @@ def test_print_report_shows_management_blockers():
     out = stream.getvalue()
     assert "CRITICAL MANAGEMENT ACCOUNT BLOCKERS" in out
     assert "IAM Identity Center" in out
+    assert "[CRITICAL]" in out
+    # Output must be plain text: no emoji / status icons.
+    assert out.isascii()
+
+
+def test_severity_tag_levels():
+    assert check_services._severity_tag("CRITICAL - x") == "[CRITICAL]"
+    assert check_services._severity_tag("HIGH - x") == "[HIGH]"
+    assert check_services._severity_tag("INFO - x") == "[INFO]"
+    assert check_services._severity_tag("") == "[----]"
 
 
 def test_write_json_output_creates_timestamped_file(tmp_path):

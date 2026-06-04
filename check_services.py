@@ -24,6 +24,22 @@ CT_SNS_TOPIC_NAMES = (
     "aws-controltower-AggregateSecurityNotifications",
 )
 
+# IAM role names that AWS Control Tower creates. If an account was previously
+# under a Control Tower (e.g. in the source organization), these are left behind
+# and cause "role already exists" failures when re-enrolling in a new org.
+CT_IAM_ROLE_NAMES = (
+    "AWSControlTowerExecution",
+    "aws-controltower-AdministratorExecutionRole",
+    "aws-controltower-ReadOnlyExecutionRole",
+    "aws-controltower-ConfigRecorderRole",
+    "aws-controltower-ForwardSnsNotificationRole",
+    "aws-controltower-CloudWatchLogsRole",
+)
+
+# Prefix CloudFormation uses for Control Tower baseline stacks/StackSet instances.
+# Leftovers cause resource-naming-conflict failures on re-enrollment.
+CT_CFN_STACK_PREFIX = "AWSControlTowerBP-"
+
 
 def log(message: str, *, quiet: bool = False) -> None:
     """Write a progress message to stderr so stdout stays machine-readable."""
@@ -48,12 +64,30 @@ def aws_org_accounts() -> List[Dict[str, Any]]:
     return accounts
 
 
-def aws_org_management_account_id() -> str:
-    """Return the organization's management account ID."""
+def get_current_account_id() -> str:
+    """Return the account ID behind the current (ambient) credentials."""
+    return boto3.client("sts").get_caller_identity()["Account"]
+
+
+def aws_org_management_account_id() -> Optional[str]:
+    """Return the organization's management account ID, or ``None`` if it cannot
+    be determined.
+
+    ``DescribeOrganization`` is the only reliable source of the management
+    account ID, but some read-only roles (notably the AWS-managed
+    ``ReadOnlyAccess`` permission set) can list accounts yet are denied
+    ``DescribeOrganization``. In that case we degrade gracefully: every account
+    is still scanned; only the management-account-only checks are skipped.
+    """
     client = boto3.client("organizations")
     try:
         response = client.describe_organization()
     except botocore.exceptions.ClientError as error:
+        if _is_access_denied(error):
+            log("Warning: cannot call organizations:DescribeOrganization; the "
+                "management account cannot be identified, so management-only "
+                "checks (Organizations, Control Tower, SSO) will be skipped.")
+            return None
         log(f"Error retrieving the management account ID: {error}")
         raise
     organization = response["Organization"]
@@ -61,10 +95,10 @@ def aws_org_management_account_id() -> str:
     return organization.get("ManagementAccountId") or organization["MasterAccountId"]
 
 
-def get_all_account_ids(management_account_id: str) -> List[str]:
+def get_all_account_ids(management_account_id: Optional[str]) -> List[str]:
     """Return all account IDs, guaranteeing the management account is included."""
     account_ids = [account["Id"] for account in aws_org_accounts()]
-    if management_account_id not in account_ids:
+    if management_account_id and management_account_id not in account_ids:
         account_ids.insert(0, management_account_id)
     return account_ids
 
@@ -168,23 +202,40 @@ def check_config(session: Any, region: str, results: List[Dict]) -> None:
             log(f"    Error checking Config in {region}: {error}")
 
 
-def check_cloudtrail_org_trails(session: Any, region: str, results: List[Dict]) -> None:
-    """Flag organization CloudTrail trails that stop logging after migration."""
+def check_cloudtrail_trails(session: Any, region: str, results: List[Dict]) -> None:
+    """Flag organization trails (break after migration) and account-level trails
+    that will double-bill once Control Tower creates its own org trail."""
     client = session.client("cloudtrail", region_name=region)
     try:
         response = client.describe_trails(includeShadowTrails=True)
-        for trail in response.get("trailList", []):
-            if trail.get("IsOrganizationTrail"):
-                results.append({
-                    "service": "CloudTrail - Org Trail",
-                    "region": region,
-                    "status": "Org Trail Exists",
-                    "details": f"Trail: {trail.get('Name')}, ARN: {trail.get('TrailARN')}",
-                    "criticality": "HIGH - Org trail will stop working after migration",
-                })
     except botocore.exceptions.ClientError as error:
         if not _is_access_denied(error):
             log(f"    Error checking CloudTrail in {region}: {error}")
+        return
+
+    for trail in response.get("trailList", []):
+        # Shadow copies of multi-region trails appear in every region; only act
+        # on the trail in its home region to avoid duplicate findings.
+        if trail.get("IsMultiRegionTrail") and trail.get("HomeRegion") != region:
+            continue
+        if trail.get("IsOrganizationTrail"):
+            results.append({
+                "service": "CloudTrail - Org Trail",
+                "region": region,
+                "status": "Org Trail Exists",
+                "details": f"Trail: {trail.get('Name')}, ARN: {trail.get('TrailARN')}",
+                "criticality": "HIGH - Org trail will stop working after migration",
+            })
+        else:
+            results.append({
+                "service": "CloudTrail - Account Trail",
+                "region": region,
+                "status": "Account Trail Exists",
+                "details": f"Trail: {trail.get('Name')} - may double-bill once Control "
+                           "Tower enables its own org trail",
+                "criticality": "INFO - Consider deleting to avoid duplicate CloudTrail "
+                               "charges after enrollment",
+            })
 
 
 def check_sns_topic_conflicts(session: Any, region: str, results: List[Dict]) -> None:
@@ -325,14 +376,75 @@ def check_backup_org_resources(session: Any, region: str, results: List[Dict]) -
                 log(f"    Error reading Backup vault policy in {region}: {error}")
 
 
+def check_controltower_cfn_stacks(session: Any, region: str, results: List[Dict]) -> None:
+    """Flag leftover Control Tower CloudFormation baseline stacks.
+
+    Stacks named ``AWSControlTowerBP-*`` (and the resources they create, e.g. the
+    ``aws-controltower-NotificationForwarder`` Lambda) left over from a previous
+    Control Tower cause resource-naming-conflict failures on re-enrollment.
+    """
+    client = session.client("cloudformation", region_name=region)
+    try:
+        paginator = client.get_paginator("list_stacks")
+        for page in paginator.paginate(
+            StackStatusFilter=[
+                "CREATE_COMPLETE", "UPDATE_COMPLETE", "UPDATE_ROLLBACK_COMPLETE",
+                "ROLLBACK_COMPLETE", "IMPORT_COMPLETE",
+            ]
+        ):
+            for stack in page.get("StackSummaries", []):
+                name = stack.get("StackName", "")
+                if name.startswith(CT_CFN_STACK_PREFIX):
+                    results.append({
+                        "service": "CloudFormation - Control Tower Stack",
+                        "region": region,
+                        "status": "Exists",
+                        "details": f"Stack: {name} - leftover Control Tower baseline stack",
+                        "criticality": "CRITICAL - Delete before re-enrolling; causes "
+                                       "resource-naming conflicts",
+                    })
+    except botocore.exceptions.ClientError as error:
+        if not _is_access_denied(error):
+            log(f"    Error checking CloudFormation in {region}: {error}")
+
+
+def check_default_vpc(session: Any, region: str, results: List[Dict]) -> None:
+    """Flag the presence of a default VPC.
+
+    Control Tower removes the default VPC during baselining; a default VPC that
+    is added back can put an enrolled account into a ``Tainted`` state.
+    """
+    client = session.client("ec2", region_name=region)
+    try:
+        response = client.describe_vpcs(
+            Filters=[{"Name": "isDefault", "Values": ["true"]}]
+        )
+    except botocore.exceptions.ClientError as error:
+        if not _is_access_denied(error):
+            log(f"    Error checking default VPC in {region}: {error}")
+        return
+
+    for vpc in response.get("Vpcs", []):
+        results.append({
+            "service": "EC2 - Default VPC",
+            "region": region,
+            "status": "Exists",
+            "details": f"Default VPC: {vpc.get('VpcId')}",
+            "criticality": "INFO - Control Tower removes the default VPC; a re-added "
+                           "default VPC can put the account in a Tainted state",
+        })
+
+
 REGIONAL_CHECKS = (
     check_sts_region_enabled,
     check_config,
     check_sns_topic_conflicts,
-    check_cloudtrail_org_trails,
+    check_cloudtrail_trails,
     check_securityhub_delegation,
     check_guardduty_delegation,
     check_backup_org_resources,
+    check_controltower_cfn_stacks,
+    check_default_vpc,
 )
 
 
@@ -357,6 +469,33 @@ def check_control_tower(session: Any, results: List[Dict]) -> None:
             "InvalidRequestException"
         ):
             log(f"    Error checking Control Tower: {error}")
+
+
+def check_controltower_iam_roles(session: Any, results: List[Dict]) -> None:
+    """Flag leftover Control Tower IAM roles that block re-enrollment.
+
+    IAM is global, so this is checked once per account. A role left over from a
+    previous Control Tower causes a "role already exists" failure when the
+    account is enrolled into a new organization's Control Tower.
+    """
+    client = session.client("iam", region_name=GLOBAL_REGION)
+    for role_name in CT_IAM_ROLE_NAMES:
+        try:
+            client.get_role(RoleName=role_name)
+        except botocore.exceptions.ClientError as error:
+            if error.response["Error"]["Code"] in ("NoSuchEntity", "NoSuchEntityException"):
+                continue
+            if not _is_access_denied(error):
+                log(f"    Error checking IAM role {role_name}: {error}")
+            continue
+        results.append({
+            "service": "IAM - Control Tower Role",
+            "region": "global",
+            "status": "Exists",
+            "details": f"Role: {role_name} - leftover from a previous Control Tower",
+            "criticality": "CRITICAL - Delete before re-enrolling; blocks enrollment "
+                           "with a 'role already exists' error",
+        })
 
 
 def check_ram_shares(session: Any, results: List[Dict]) -> None:
@@ -481,6 +620,7 @@ def check_global_services(session: Any, results: List[Dict], *, quiet: bool) -> 
     """Run checks for global, org-tied resources."""
     log("\n  Checking global services...", quiet=quiet)
     check_ram_shares(session, results)
+    check_controltower_iam_roles(session, results)
 
 
 def check_regional_services(
@@ -532,6 +672,14 @@ def _criticality_rank(finding: Dict) -> int:
     return 2
 
 
+def _severity_tag(criticality: str) -> str:
+    """Return a fixed-width plain-text severity tag for ``criticality``."""
+    for level in ("CRITICAL", "HIGH", "INFO"):
+        if criticality.startswith(level):
+            return f"[{level}]"
+    return "[----]"
+
+
 def count_critical_findings(all_results: List[Dict]) -> int:
     """Return the total number of CRITICAL findings across all accounts."""
     return sum(
@@ -556,17 +704,17 @@ def print_report(all_results: List[Dict], *, stream) -> None:
         if finding.get("criticality", "").startswith("CRITICAL")
     ]
     if mgmt_critical:
-        print("\n⚠️  CRITICAL MANAGEMENT ACCOUNT BLOCKERS:", file=stream)
+        print("\nCRITICAL MANAGEMENT ACCOUNT BLOCKERS:", file=stream)
         print("-" * 80, file=stream)
         for finding in mgmt_critical:
             criticality = finding.get("criticality", "")
             action = criticality.split(" - ", 1)[1] if " - " in criticality else criticality
-            print(f"\n  ❌ {finding['service']}", file=stream)
+            print(f"\n  [CRITICAL] {finding['service']}", file=stream)
             print(f"     Status: {finding['status']}", file=stream)
             print(f"     {finding['details']}", file=stream)
             print(f"     Action Required: {action}", file=stream)
         print("\n" + "-" * 80, file=stream)
-        print("⚠️  These issues MUST be resolved before proceeding with migration!", file=stream)
+        print("These issues MUST be resolved before proceeding with migration!", file=stream)
         print("-" * 80, file=stream)
 
     print("\n\nDETAILED FINDINGS BY ACCOUNT:", file=stream)
@@ -578,24 +726,22 @@ def print_report(all_results: List[Dict], *, stream) -> None:
         findings = account.get("findings", [])
 
         if account.get("error"):
-            print(f"\n❌ {label}: ERROR - {account['error']}", file=stream)
+            print(f"\n{label}: ERROR - {account['error']}", file=stream)
         elif findings:
-            print(f"\n📋 {label}: {len(findings)} service(s) found", file=stream)
+            print(f"\n{label}: {len(findings)} service(s) found", file=stream)
             for finding in sorted(findings, key=_criticality_rank):
                 criticality = finding.get("criticality", "")
-                marker = "🔴 " if criticality.startswith("CRITICAL") else (
-                    "🟡 " if criticality.startswith("HIGH") else ""
-                )
+                tag = _severity_tag(criticality)
                 print(
-                    f"  {marker}• {finding['service']:35} | "
+                    f"  {tag:10} {finding['service']:35} | "
                     f"{finding['region']:15} | {finding['status']:20}",
                     file=stream,
                 )
                 print(f"    {finding['details']}", file=stream)
                 if criticality:
-                    print(f"    ⚠️  {criticality}", file=stream)
+                    print(f"    {criticality}", file=stream)
         else:
-            print(f"\n✅ {label}: No conflicting services found", file=stream)
+            print(f"\n{label}: No conflicting services found", file=stream)
 
 
 def write_json_output(all_results: List[Dict], output_dir: str, account_id: str) -> str:
@@ -649,6 +795,7 @@ def run(args: argparse.Namespace) -> int:
     log("\nRetrieving all AWS accounts...", quiet=args.quiet)
 
     management_account_id = aws_org_management_account_id()
+    current_account_id = get_current_account_id()
     account_ids = get_all_account_ids(management_account_id)
     log(f"Found {len(account_ids)} account(s) to check", quiet=args.quiet)
 
@@ -660,8 +807,11 @@ def run(args: argparse.Namespace) -> int:
     all_results: List[Dict] = []
     for account_id in sorted_accounts:
         try:
-            if account_id == management_account_id:
-                log("\nUsing default credentials for management account", quiet=args.quiet)
+            # Use the ambient credentials for the account we are already
+            # authenticated in; assume a role for the others.
+            if account_id == current_account_id:
+                log(f"\nUsing current credentials for account {account_id}",
+                    quiet=args.quiet)
                 session = boto3.Session()
             else:
                 session = assume_role(account_id, args.role_name)
@@ -683,14 +833,16 @@ def run(args: argparse.Namespace) -> int:
         json.dump(all_results, sys.stdout, indent=2, default=str)
         sys.stdout.write("\n")
     else:
-        path = write_json_output(all_results, args.output_dir, management_account_id)
+        path = write_json_output(
+            all_results, args.output_dir, management_account_id or current_account_id
+        )
         log(f"\nDetailed results written to: {path}", quiet=args.quiet)
 
     critical_count = count_critical_findings(all_results)
     if critical_count:
-        log(f"\n❌ {critical_count} CRITICAL blocker(s) found.", quiet=args.quiet)
+        log(f"\n{critical_count} CRITICAL blocker(s) found.", quiet=args.quiet)
         return 2
-    log("\n✅ Check complete - no CRITICAL blockers found.", quiet=args.quiet)
+    log("\nCheck complete - no CRITICAL blockers found.", quiet=args.quiet)
     return 0
 
 

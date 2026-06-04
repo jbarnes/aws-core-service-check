@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.0.0] - 2026-06-04
 
 ### Added
+- Additional Control Tower / migration blocker checks:
+  - leftover `aws-controltower-*` / `AWSControlTowerExecution` IAM roles
+    (CRITICAL: cause "role already exists" failures on re-enrollment);
+  - leftover `AWSControlTowerBP-*` CloudFormation baseline stacks (CRITICAL);
+  - account-level CloudTrail trails that double-bill once Control Tower enables
+    its own org trail (INFO);
+  - presence of a default VPC, which Control Tower removes during baselining
+    (INFO).
 - Non-interactive CLI (`argparse`) with `--role-name`, `--output-dir`,
   `--stdout`, and `--quiet`.
 - Process exit codes for automation: `0` when no CRITICAL blockers are found,
@@ -27,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   packaging.
 - Progress and report output now go to stderr, leaving stdout clean for piping
   JSON (`--stdout`).
+- Console report output is plain text (e.g. `[CRITICAL]`, `[HIGH]`, `[INFO]`
+  severity tags) instead of emoji/status icons.
+- The CloudTrail check now de-duplicates multi-region shadow trails by only
+  reporting a trail in its home region.
 - Pagination now uses boto3 paginators for accounts, SNS topics, and Backup
   vaults instead of partial manual paging.
 
